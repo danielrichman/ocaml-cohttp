@@ -60,9 +60,10 @@ module Response = struct
   include (Make(IO) : module type of Make(IO) with type t := t)
 end
 
-let pipe_of_body read_chunk ic =
+let pipe_of_body ?suppress_pipe_close read_chunk ic =
   let open Cohttp.Transfer in
-  Pipe.init (fun writer ->
+  let reader, writer = Pipe.create () in
+  let finished_reading =
     Deferred.repeat_until_finished () (fun () ->
       read_chunk ic >>= function
       | Chunk buf ->
@@ -79,8 +80,24 @@ let pipe_of_body read_chunk ic =
         >>| fun _ -> `Repeat ()
       | Final_chunk buf ->
         Pipe.write_when_ready writer ~f:(fun write -> write buf)
-        >>| fun _ -> `Finished ()
-      | Done -> return (`Finished ())))
+        >>| fun _ -> `Finished `Finished_reading
+      | Done -> return (`Finished `Finished_reading))
+  in
+  upon finished_reading (fun `Finished_reading ->
+    (* If the loop terminated due to an interruption, don't close the pipe:
+       it's misleading, as a closed pipe looks like successful completion. *)
+    let should_close =
+      match Option.bind suppress_pipe_close Deferred.peek with
+      | None -> true
+      | Some () -> false
+    in
+    if should_close
+    then Pipe.close writer
+  );
+  (* There's an important difference between [Pipe.closed reader] and
+     [finished_reading], because the reader can call [Pipe.close_read] on
+     the read end of the pipe. *)
+  (reader, finished_reading)
 
 module Body = struct
   module B = Cohttp.Body
@@ -155,15 +172,17 @@ end
 
 module Client = struct
 
-  let read_request ic =
+  let read_request ?suppress_pipe_close ic =
     Response.read ic >>| function
     | `Eof -> failwith "Connection closed by remote host"
     | `Invalid reason -> failwith reason
     | `Ok res ->
       (* Build a response pipe for the body *)
       let reader = Response.make_body_reader res ic in
-      let pipe = pipe_of_body Response.read_body_chunk reader in
-      (res, pipe)
+      let (pipe, finished_reading) = 
+        pipe_of_body ?suppress_pipe_close Response.read_body_chunk reader 
+      in
+      (res, pipe, finished_reading)
 
   let request ?interrupt ?ssl_config ?uri ?(body=`Empty) req =
     (* Connect to the remote side *)
@@ -173,39 +192,75 @@ module Client = struct
       | None -> Request.uri req in
     Net.connect_uri ?interrupt uri
     >>= fun (ic,oc) ->
-    Request.write (fun writer -> Body.write Request.write_body body writer) req oc
-    >>= fun () ->
-    read_request ic >>| fun (resp, body) ->
-    don't_wait_for (
-      Pipe.closed body >>= fun () ->
-      Deferred.all_ignore [Reader.close ic; Writer.close oc]);
-    (resp, `Pipe body)
+    let teardown () =
+      don't_wait_for (Reader.close ic);
+      don't_wait_for (Writer.close oc)
+    in
+    let monitor = Monitor.create () in
+    (* even after [read_request] has returned, all the reading jobs will be
+       running under [monitor], and we need to clean up if they fail. *)
+    upon (Monitor.get_next_error monitor) (fun _ -> teardown ());
+    Option.iter interrupt ~f:(fun interrupt -> upon interrupt teardown);
+    Scheduler.within' ~monitor (fun () ->
+      Request.write (fun writer -> Body.write Request.write_body body writer) req oc
+      >>= fun () ->
+      read_request ?suppress_pipe_close:interrupt ic 
+      >>| fun (resp, body, finished_reading) ->
+      (* We want to cleanup both if we complete reading successfully, but also we
+         want to prematurely teardown if the user closees the read end of the pipe. *)
+      upon finished_reading (fun `Finished_reading -> teardown ());
+      upon (Pipe.closed body) teardown;
+      (resp, `Pipe body)
+    )
 
   let callv ?interrupt ?ssl_config uri reqs =
-    let reqs_c = ref 0 in
-    let resp_c = ref 0 in
-    Net.connect_uri ?interrupt ?ssl_config uri >>| fun (ic, oc) ->
-    reqs
-    |> Pipe.iter ~f:(fun (req, body) ->
-      incr reqs_c;
-      Request.write (fun writer -> Body.write Request.write_body body writer)
-        req oc)
-    |> don't_wait_for;
-    let last_body_drained = ref Deferred.unit in
-    let responses = Reader.read_all ic (fun ic ->
-      !last_body_drained >>= fun () ->
-      if Pipe.is_closed reqs && (!resp_c >= !reqs_c) then
-        return `Eof
-      else
-        ic |> read_request >>| fun (resp, body) ->
-        incr resp_c;
-        last_body_drained := Pipe.closed body;
-        `Ok (resp, `Pipe body)
-    ) in
-    don't_wait_for (
-      Pipe.closed reqs >>= fun () ->
-      Pipe.closed responses >>= fun () ->
-      Writer.close oc
+    Net.connect_uri ?interrupt ?ssl_config uri 
+    >>| fun (ic, oc) ->
+    (* The [sent_requests] pipe contains a unit for every request successfully
+       sent and is closed when all requests have been successfully sent. *)
+    let sent_requests, sent_requests_writer = Pipe.create () in
+    let responses, responses_writer = Pipe.create () in
+    let teardown () =
+      don't_wait_for (Reader.close ic);
+      don't_wait_for (Writer.close oc)
+    in
+    let monitor = Monitor.create () in
+    upon (Monitor.get_next_error monitor) (fun _ -> teardown ());
+    upon (Pipe.closed responses) teardown;
+    Option.iter interrupt ~f:(fun interrupt -> upon interrupt teardown);
+    Scheduler.within ~monitor (fun () ->
+      don't_wait_for (
+        Pipe.iter reqs ~f:(fun (req, body) ->
+          Pipe.write_without_pushback sent_requests_writer ();
+          Request.write 
+            (fun writer -> Body.write Request.write_body body writer)
+            req oc
+        )
+        >>= fun () ->
+        (* only allow the responses pipe to close if we successfully write
+           all the requests. *)
+        Pipe.close sent_requests_writer;
+        Deferred.unit
+      );
+      don't_wait_for (
+        Pipe.iter sent_requests (fun () ->
+          read_request ic ?suppress_pipe_close:interrupt
+          >>= fun (resp, body, finished_reading) ->
+          Pipe.write responses_writer (resp, `Pipe body)
+          >>= fun () ->
+          (* We can only move on to the next request when we're done reading the
+             current one. Note that the user might have called [Pipe.close_read]
+             on their pipe, in which case we'll have to read and discard all remaining
+             chunks. We have to wait for this to complete until we can use the
+             reader again. *)
+          finished_reading
+          >>= fun `Finished_reading ->
+          Deferred.unit
+        )
+        >>= fun () ->
+        Pipe.close responses_writer;
+        Deferred.unit
+      )
     );
     responses
 
@@ -272,24 +327,31 @@ module Server = struct
   let read_body req rd =
     match Request.has_body req with
     (* TODO maybe attempt to read body *)
-    | `No | `Unknown -> (`Empty, Deferred.unit)
+    | `No | `Unknown -> (`Empty, return `Finished_reading)
     | `Yes -> (* Create a Pipe for the body *)
       let reader = Request.make_body_reader req rd in
-      let pipe = pipe_of_body Request.read_body_chunk reader in
-      (`Pipe pipe, Pipe.closed pipe)
+      let (pipe, finished_reading) = pipe_of_body Request.read_body_chunk reader in
+      (`Pipe pipe, finished_reading)
 
   let handle_client handle_request sock rd wr =
-    let last_body_pipe_drained = ref Deferred.unit in
-    let requests_pipe =
-      Reader.read_all rd (fun rd ->
-        !last_body_pipe_drained >>= fun () ->
-        Request.read rd >>| function
-        | `Eof | `Invalid _ -> `Eof
+    let requests_pipe, requests_pipe_writer = Pipe.create () in
+    don't_wait_for (
+      Deferred.repeat_until_finished () (fun () ->
+        Request.read rd 
+        >>= function
+        | `Eof | `Invalid _ -> return (`Finished ())
         | `Ok req ->
           let body, finished = read_body req rd in
-          last_body_pipe_drained := finished;
-          `Ok (req, body)
-      ) in
+          Pipe.write requests_pipe_writer (req, body)
+          >>= fun () ->
+          finished
+          >>= fun `Finished_reading ->
+          return (`Repeat ())
+      )
+      >>= fun () ->
+      Pipe.close requests_pipe_writer;
+      Deferred.unit
+    );
     Pipe.iter requests_pipe ~f:(fun (req, body) ->
       handle_request ~body sock req
       >>= fun (res, res_body) ->
